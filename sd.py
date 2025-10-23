@@ -136,8 +136,9 @@ class ToxicCommentDataset(Dataset):
             sequence = [self.preprocessor.tokenizer.pad_token_id] * self.preprocessor.max_seq_length
 
 
-        # 创建attention mask（非零位置为1）
-        attention_mask = [1 if token != 0 else 0 for token in sequence]
+        # 创建attention mask：非 pad 位置为 1
+        pad_id = self.preprocessor.tokenizer.pad_token_id
+        attention_mask = [1 if token != pad_id else 0 for token in sequence]
 
         return (
             torch.tensor(sequence, dtype=torch.long),
@@ -254,6 +255,7 @@ from torch.utils.data import Dataset
 import pandas as pd
 import numpy as np
 from transformers import GPT2Tokenizer, GPT2Model
+from sklearn.metrics import roc_auc_score, f1_score
 from collections import Counter
 import re
 import os
@@ -271,11 +273,17 @@ class GPT2ClassificationModel(nn.Module):
     super().__init__()
     self.gpt2 = GPT2Model.from_pretrained('gpt2')
     config = self.gpt2.config
+    self.dropout = nn.Dropout(p=0.1)
     self.classifier = nn.Linear(config.hidden_size, num_labels, bias=True)
 
   def forward(self,input_ids,attention_mask):
     gpt2_out = self.gpt2(input_ids,attention_mask=attention_mask)
-    logits = self.classifier(gpt2_out.last_hidden_state[:, -1, :])
+    hidden = gpt2_out.last_hidden_state  # [B, T, H]
+    mask = attention_mask.unsqueeze(-1).float()  # [B, T, 1]
+    masked_sum = (hidden * mask).sum(dim=1)
+    denom = mask.sum(dim=1).clamp(min=1e-6)
+    pooled = masked_sum / denom
+    logits = self.classifier(self.dropout(pooled))
     return logits
 
 # ====== 解冻控制：只解冻顶层若干层 ======
@@ -336,6 +344,64 @@ def multilabel_accuracy(y_hat, y):
     y = y.bool()
     label_wise_acc = (predictions == y).float().mean()
     return label_wise_acc.item()
+
+def collect_probs_and_labels(net, data_iter, device):
+    net.eval()
+    all_probs = []
+    all_labels = []
+    with torch.no_grad():
+        for batch in data_iter:
+            input_ids, attention_mask, labels = batch
+            input_ids = input_ids.to(device, non_blocking=True)
+            attention_mask = attention_mask.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            if device.type == 'cuda':
+                with torch.cuda.amp.autocast():
+                    logits = net(input_ids, attention_mask)
+            else:
+                logits = net(input_ids, attention_mask)
+            probs = torch.sigmoid(logits)
+            all_probs.append(probs.detach().cpu())
+            all_labels.append(labels.detach().cpu())
+    probs = torch.cat(all_probs, dim=0).numpy()
+    labels = torch.cat(all_labels, dim=0).numpy()
+    return probs, labels
+
+def tune_thresholds_and_metrics(probs, labels):
+    import numpy as np
+    num_labels = probs.shape[1]
+    best_thresholds = []
+    per_label_f1 = []
+    aucs = []
+    for j in range(num_labels):
+        # AUC（可能遇到全负/全正的情形，需保护）
+        try:
+            auc = roc_auc_score(labels[:, j], probs[:, j])
+        except Exception:
+            auc = float('nan')
+        aucs.append(auc)
+
+        thrs = np.linspace(0.05, 0.95, 37)
+        best_t, best_f1 = 0.5, -1.0
+        y_true = labels[:, j]
+        p = probs[:, j]
+        for t in thrs:
+            y_pred = (p >= t).astype(int)
+            try:
+                f1 = f1_score(y_true, y_pred, zero_division=0)
+            except Exception:
+                f1 = 0.0
+            if f1 > best_f1:
+                best_f1 = f1
+                best_t = t
+        best_thresholds.append(best_t)
+        per_label_f1.append(best_f1)
+
+    # 宏平均（忽略 NaN）
+    aucs_np = np.array(aucs, dtype=float)
+    macro_auc = float(np.nanmean(aucs_np)) if np.isnan(aucs_np).any() else float(aucs_np.mean())
+    macro_f1 = float(np.mean(per_label_f1))
+    return macro_auc, macro_f1, best_thresholds
 
 def train_gpt2_epoch(net, train_iter, loss, updater, device, scheduler=None,progress_bar=None):
     """
@@ -412,7 +478,7 @@ def evaluate_gpt2_accuracy(net, data_iter, device):
             metric.add(acc * labels.shape[0], labels.shape[0])
     return metric[0] / metric[1]
 
-def train_gpt2_model(net, train_iter, val_iter, loss, trainer, num_epochs, devices, scheduler=None):
+def train_gpt2_model(net, train_iter, val_iter, loss, trainer, num_epochs, devices, scheduler=None, patience=2):
     """
     完整训练流程
     """
@@ -425,6 +491,9 @@ def train_gpt2_model(net, train_iter, val_iter, loss, trainer, num_epochs, devic
     device = devices[0] if isinstance(devices, list) else devices
     net = net.to(device)
 
+    best_auc = -1.0
+    best_state = None
+    epochs_no_improve = 0
     for epoch in range(num_epochs):
         train_iter_tqdm = tqdm(train_iter,
                             desc=f"Epoch {epoch+1}/{num_epochs}",
@@ -436,16 +505,33 @@ def train_gpt2_model(net, train_iter, val_iter, loss, trainer, num_epochs, devic
         )
 
         # 验证
-        val_acc = evaluate_gpt2_accuracy(net, val_iter, device)
+        val_probs, val_labels = collect_probs_and_labels(net, val_iter, device)
+        macro_auc, macro_f1, best_thrs = tune_thresholds_and_metrics(val_probs, val_labels)
 
-        tqdm.write(f'Epoch {epoch + 1}: '
-              f'loss {train_loss:.3f}, '
-              f'train acc {train_acc:.3f}, '
-              f'val acc {val_acc:.3f}, '
-              f'lr {trainer.param_groups[0]["lr"]:.6f}')
+        tqdm.write(
+            f'Epoch {epoch + 1}: '
+            f'loss {train_loss:.3f}, '
+            f'train acc {train_acc:.3f}, '
+            f'val macro AUC {macro_auc:.4f}, '
+            f'val macro F1 {macro_f1:.4f}, '
+            f'lr {trainer.param_groups[0]["lr"]:.6f}'
+        )
+
+        # Early stopping on macro AUC
+        if macro_auc > best_auc:
+            best_auc = macro_auc
+            best_state = {k: v.cpu().clone() for k, v in net.state_dict().items()}
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                tqdm.write(f"Early stopping at epoch {epoch + 1} (best macro AUC {best_auc:.4f})")
+                break
 
     # print(f'Training completed in {timer.stop():.1f} sec')
-    print(f'Final: train acc {train_acc:.3f}, val acc {val_acc:.3f}')
+    if best_state is not None:
+        net.load_state_dict(best_state)
+    print(f'Final: best val macro AUC {best_auc:.4f}')
 
 
 # ============ 主要执行代码 ============
@@ -477,31 +563,50 @@ print(f"可训练参数数量: {trainable_params:,} (解冻顶层 {UNFREEZE_TOP_
 # ------------------------------------
 
 
-# 优化器和学习率调度器（只优化可训练参数）
-trainer = optim.Adam((p for p in net.parameters() if p.requires_grad), lr=lr, weight_decay=0.01)
+from torch.optim import AdamW
+from transformers import get_linear_schedule_with_warmup
 
-# 添加学习率调度器以提升训练效果
-scheduler = optim.lr_scheduler.OneCycleLR(
-    trainer,
-    max_lr=lr * 5,  # 最大学习率
-    steps_per_epoch=len(train_iter),
-    epochs=num_epochs,
-    pct_start=0.3  # 前30%时间用于升温
-)
+# 优化器（分组学习率）：骨干较小 LR，分类头较大 LR
+base_params = []
+head_params = []
+for n, p in net.named_parameters():
+    if not p.requires_grad:
+        continue
+    (head_params if "classifier" in n else base_params).append(p)
 
-# 损失函数 - 多标签分类使用BCEWithLogitsLoss
-loss = nn.BCEWithLogitsLoss(reduction="none")  # 每个样本每个标签独立计算
+trainer = AdamW([
+    {"params": base_params, "lr": 5e-5},
+    {"params": head_params, "lr": 1e-3},
+], weight_decay=0.01)
+
+# 线性 warmup + 线性衰减（10% 预热）
+num_training_steps = len(train_iter) * num_epochs
+num_warmup_steps = max(1, int(0.1 * num_training_steps))
+scheduler = get_linear_schedule_with_warmup(trainer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps)
+
+# 损失函数 - 计算 pos_weight 以缓解类不平衡
+train_labels_array = np.array(train_iter.dataset.labels)
+pos = train_labels_array.sum(axis=0)
+neg = len(train_labels_array) - pos
+pos_weight = torch.tensor((neg / (pos + 1e-6)).tolist(), dtype=torch.float).to(device)
+loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction="none")
 
 
-# 开始训练 - 使用学习率调度器
-# train_gpt2_model(net, train_iter, val_iter, loss, trainer, num_epochs, device, scheduler)
+# 启用稳定性选项
+net.gpt2.config.use_cache = False
+try:
+    net.gpt2.gradient_checkpointing_enable()
+except Exception:
+    pass
+
+# 开始训练
+train_gpt2_model(net, train_iter, val_iter, loss, trainer, num_epochs, device, scheduler)
 
 print("\n" + "="*60)
 print("🎉 Huggingface GPT2 多标签分类 训练完成!")
 
 
 import time
-from tqdm.std import tqdm
 def generate_submission(model, test_loader, device, test_ids, output_path):
     """
     生成Kaggle提交文件
@@ -514,7 +619,7 @@ def generate_submission(model, test_loader, device, test_ids, output_path):
         start_time = time.time()
         test_loader_tqdm = tqdm(test_loader,bar_format=" {n_fmt}/{total_fmt} {postfix}")
 
-        for batch in test_loader_tqdm:
+        for i, batch in enumerate(test_loader_tqdm):
             try:
                 input_ids, attention_mask, _ = batch
                 input_ids = input_ids.to(device, non_blocking=True)
