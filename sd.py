@@ -1,271 +1,95 @@
-##屏蔽进度条，github中不支持显示，整个notebook都不显示了
-import os
-# 设置这个环境变量来禁用tqdm进度条
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-
-import datasets
-datasets.disable_progress_bar()
-
 import os
 import urllib.request
 from pathlib import Path
+import re
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import numpy as np
+from transformers import GPT2Tokenizer, GPT2Model
+from sklearn.metrics import roc_auc_score, f1_score
+from tqdm import tqdm
+import time
+import warnings
+import datasets
 
-# === 1. 全局配置 ===
+warnings.filterwarnings('ignore')
+
+# 全局配置
 URLPrefix = "https://pro-5gu0t2os8cdd45f2-1251420592.tcloudbaseapp.com/toxic-comment-classification"
 data_dir = 'toxic-comment'
 DATA_DIR = Path(data_dir)
 FILENAMES = ["train.csv","test.csv","test_labels.csv","sample_submission.csv"]
 
-BATCH_SIZE = 8
-RANDOM_STATE = 123
-NUM_WORKERS = 2
 
-
-# === 2. 数据准备 ===
 def prepare_csv_list():
-    # 如果toxic-comment 不存在，创建该目录
+    """下载数据文件"""
     if not DATA_DIR.exists():
         DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     for fileName in FILENAMES:
         URL = f"{URLPrefix}/{fileName}"
-        DATA_FILE =DATA_DIR/fileName
+        DATA_FILE = DATA_DIR / fileName
         if not DATA_FILE.exists():
             print(f"⬇️ Downloading {fileName}...")
             with urllib.request.urlopen(URL) as r, open(DATA_FILE, "wb") as f:
                 f.write(r.read())
         else:
-            print(f"✅ already exists: {fileName} ")
-
-import re
-import pandas as pd
-from transformers import GPT2Tokenizer
-import torch
-from torch.utils.data import Dataset
+            print(f"✅ already exists: {fileName}")
 
 
-class TextPreprocessor:
-    """使用 GPT2Tokenizer 的文本预处理器"""
-
-    def __init__(self,
-                 model_name="gpt2",
-                 max_seq_length=128,
-                 add_special_tokens=True,
-                 padding=True,
-                 truncation=True):
-        """
-        Args:
-            model_name (str): 使用的预训练 GPT2 分词器名称（如 "gpt2", "gpt2-medium"）
-            max_seq_length (int): 最大序列长度
-            add_special_tokens (bool): 是否添加特殊标记（如 BOS/EOS）
-            padding (bool): 是否自动填充
-            truncation (bool): 是否截断超长文本
-        """
-        self.max_seq_length = max_seq_length
-        self.add_special_tokens = add_special_tokens
-        self.padding = padding
-        self.truncation = truncation
-
-        # ✅ 初始化 GPT2 分词器
-        self.tokenizer = GPT2Tokenizer.from_pretrained(model_name)
-        # GPT-2 默认没有 pad_token，需要手动设置
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        print(f"✅ GPT2Tokenizer 已加载: {model_name}")
-        print(f"词表大小: {len(self.tokenizer)}")
-
-    def clean_text(self, text: str) -> str:
-        """可选的文本清理（保留基础清洗逻辑）"""
-        if pd.isna(text):
-            return ""
-        text = str(text).strip()
-        text = re.sub(r'\s+', ' ', text)
-        return text
-
-    def build_vocab(self, texts):
-        """兼容旧接口（GPT2Tokenizer 自带词汇表，无需手动构建）"""
-        print("⚙️ 使用 GPT2Tokenizer 自带词汇表，无需手动构建。")
-        return list(self.tokenizer.get_vocab().keys())
-
-    def text_to_sequence(self, text):
-        """文本转为 GPT-2 Token ID 序列"""
-        cleaned_text = self.clean_text(text)
-        encoding = self.tokenizer(
-            cleaned_text,
-            add_special_tokens=self.add_special_tokens,
-            max_length=self.max_seq_length,
-            padding='max_length' if self.padding else False,
-            truncation=self.truncation,
-            return_tensors=None
-        )
-        return encoding["input_ids"]
-
-    def batch_encode(self, texts):
-        """批量文本编码"""
-        cleaned_texts = [self.clean_text(t) for t in texts]
-        encodings = self.tokenizer(
-            cleaned_texts,
-            add_special_tokens=self.add_special_tokens,
-            max_length=self.max_seq_length,
-            padding='max_length' if self.padding else False,
-            truncation=self.truncation,
-            return_tensors=None
-        )
-        return encodings["input_ids"]
-
-
-class ToxicCommentDataset(Dataset):
-    """有毒评论数据集"""
-
-    def __init__(self, texts, labels, preprocessor):
-        self.texts = texts
-        # self.labels = labels if labels is not None else [[0]*6]*len(texts)
-        self.labels = labels if labels is not None else [[0]*6 for _ in range(len(texts))]
-
-        self.preprocessor = preprocessor
-
-    def __len__(self):
-        return len(self.texts)
-
-    def __getitem__(self, idx):
-        text = self.texts[idx]
-        sequence = self.preprocessor.text_to_sequence(text)
-
-        if not sequence or len(sequence) == 0:
-            sequence = [self.preprocessor.tokenizer.pad_token_id] * self.preprocessor.max_seq_length
-
-
-        # 创建attention mask：非 pad 位置为 1
-        pad_id = self.preprocessor.tokenizer.pad_token_id
-        attention_mask = [1 if token != pad_id else 0 for token in sequence]
-
-        return (
-            torch.tensor(sequence, dtype=torch.long),
-            torch.tensor(attention_mask, dtype=torch.long),
-            torch.tensor(self.labels[idx], dtype=torch.float)
-        )
-
-
-def read_toxic_comments_real(data_dir, max_samples=None, is_train=True):
-    """
-    读取真实的Kaggle Toxic Comment Classification数据
-    返回格式: (texts, labels, ids)
-    """
-    if is_train:
-        csv_path = os.path.join(data_dir, 'train.csv')
-        print(f"读取训练数据: {csv_path}")
-
-        df = pd.read_csv(csv_path)
-        if max_samples:
-            df = df.head(max_samples)
-
-        texts = df['comment_text'].tolist()
-        label_columns = ['toxic', 'severe_toxic', 'obscene', 'threat', 'insult', 'identity_hate']
-        labels = df[label_columns].values.tolist()
-        ids = df['id'].tolist()
-
-        print(f"加载训练数据: {len(texts)} 条")
-        print(f"标签分布: {dict(zip(label_columns, df[label_columns].sum().tolist()))}")
-
-        return texts, labels, ids
-    else:
-        csv_path = os.path.join(data_dir, 'test.csv')
-        print(f"读取测试数据: {csv_path}")
-
-        df = pd.read_csv(csv_path)
-        if max_samples:
-            df = df.head(max_samples)
-
-        texts = df['comment_text'].tolist()
-        ids = df['id'].tolist()
-
-        print(f"加载测试数据: {len(texts)} 条")
-
-        return texts, None, ids
-
-def create_dataloaders(data_dir,batch_size):
-# 数据目录
+def create_dataloaders(data_dir, batch_size, max_length=128):
+    """创建数据加载器"""
     prepare_csv_list()
-
-    # 数据加载
-    print("📊 加载真实Kaggle数据...")
-
-    # 为了快速训练，限制样本数（可以根据需要调整）
-    train_texts, train_labels, train_ids = read_toxic_comments_real(
-        data_dir, max_samples=None, is_train=True
-    )
-
-    # 创建验证集（从训练数据中分割）
-    val_split = int(len(train_texts) * 0.8)
-    val_texts = train_texts[val_split:]
-    val_labels = train_labels[val_split:]
-    train_texts = train_texts[:val_split]
-    train_labels = train_labels[:val_split]
-
-    # 读取测试数据
-    test_texts, _, test_ids = read_toxic_comments_real(
-        data_dir, max_samples=None, is_train=False
-    )
-
-    print(f"\n📊 数据统计:")
-    print(f"训练数据: {len(train_texts)} 条")
-    print(f"验证数据: {len(val_texts)} 条")
-    print(f"测试数据: {len(test_texts)} 条")
-
-    # 检查数据质量
-    print(f"\n📝 数据样例:")
-    print(f"文本长度: {len(train_texts[0])}")
-    print(f"前100字符: {train_texts[0][:100]}")
-    print(f"标签: {train_labels[0]}")
-
-    preprocessor = TextPreprocessor()
-
-    print(f"\n🔧 预处理器测试:")
-    sample_sequence = preprocessor.text_to_sequence(train_texts[0])
-    print(f"序列长度: {len(sample_sequence)}")
-    print(f"非零token数: {sum(1 for x in sample_sequence if x != 0)}")
-
-
-
-    # 创建数据加载器
-    train_dataset = ToxicCommentDataset(train_texts, train_labels, preprocessor)
-    val_dataset = ToxicCommentDataset(val_texts, val_labels, preprocessor)
-    test_dataset = ToxicCommentDataset(test_texts, None, preprocessor)
-
-    train_iter = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                                              num_workers=4, pin_memory=True, persistent_workers=True)
-    val_iter = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                                           num_workers=2, pin_memory=True, persistent_workers=True)
-    test_iter = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
-                                            num_workers=2, pin_memory=True, persistent_workers=True)
-    return train_iter, val_iter, test_iter,test_ids
-
-
-    #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Kaggle Toxic Comment Classification - gpt2 版本 多标签文本分类
-"""
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset
-import pandas as pd
-import numpy as np
-from transformers import GPT2Tokenizer, GPT2Model
-from sklearn.metrics import roc_auc_score, f1_score
-from collections import Counter
-import re
-import os
-from tqdm import tqdm
-import time
-import warnings
-warnings.filterwarnings('ignore')
-
-print(f"PyTorch版本: {torch.__version__}")
-print(f"NumPy: {np.__version__}")
+    
+    # 读取数据
+    train_df = pd.read_csv(DATA_DIR / "train.csv")
+    test_df = pd.read_csv(DATA_DIR / "test.csv")
+    
+    # 分割验证集
+    val_split = int(len(train_df) * 0.8)
+    val_df = train_df.iloc[val_split:].copy()
+    train_df = train_df.iloc[:val_split].copy()
+    
+    print(f"📊 数据统计: 训练{len(train_df)} 验证{len(val_df)} 测试{len(test_df)}")
+    
+    # 初始化分词器
+    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # 预处理函数
+    def preprocess_batch(examples):
+        texts = [str(text).strip() if not pd.isna(text) else "" for text in examples['comment_text']]
+        tokenized = tokenizer(texts, truncation=True, padding='max_length', max_length=max_length, return_tensors=None)
+        return {'input_ids': tokenized['input_ids'], 'attention_mask': tokenized['attention_mask']}
+    
+    # 创建数据集
+    train_dataset = datasets.Dataset.from_pandas(train_df).map(preprocess_batch, batched=True, batch_size=1000, num_proc=4)
+    val_dataset = datasets.Dataset.from_pandas(val_df).map(preprocess_batch, batched=True, batch_size=1000, num_proc=4)
+    test_dataset = datasets.Dataset.from_pandas(test_df).map(preprocess_batch, batched=True, batch_size=1000, num_proc=4)
+    
+    # 添加标签
+    label_cols = ['toxic', 'severe_toxic', 'obscene', 'threat', 'insult', 'identity_hate']
+    def add_labels(examples):
+        return {'labels': [[examples[col][i] for col in label_cols] for i in range(len(examples['id']))]}
+    
+    train_dataset = train_dataset.map(add_labels, batched=True)
+    val_dataset = val_dataset.map(add_labels, batched=True)
+    
+    # 设置格式
+    train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
+    val_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
+    test_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask'])
+    
+    # 创建数据加载器 (优化: 增加工作进程和预取因子)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=4)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=4)
+    
+    return train_loader, val_loader, test_loader, test_df['id'].tolist()
 
 
 class GPT2ClassificationModel(nn.Module):
@@ -336,6 +160,18 @@ def try_all_gpus():
     """检测可用GPU"""
     return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+def move_batch_to_device(batch, device, has_labels=True):
+    """将批次数据移动到指定设备"""
+    input_ids, attention_mask = batch[:2]
+    input_ids = input_ids.to(device, non_blocking=True)
+    attention_mask = attention_mask.to(device, non_blocking=True)
+    
+    if has_labels and len(batch) > 2:
+        labels = batch[2].to(device, non_blocking=True)
+        return input_ids, attention_mask, labels
+    else:
+        return input_ids, attention_mask
+
 
 
 def multilabel_accuracy(y_hat, y):
@@ -345,46 +181,43 @@ def multilabel_accuracy(y_hat, y):
     label_wise_acc = (predictions == y).float().mean()
     return label_wise_acc.item()
 
-def collect_probs_and_labels(net, data_iter, device):
+def evaluate_model_metrics(net, data_iter, device):
+    """评估模型指标：收集预测结果并计算AUC和F1分数"""
     net.eval()
-    all_probs = []
-    all_labels = []
+    all_probs, all_labels = [], []
+    
+    # 收集预测结果
     with torch.no_grad():
         for batch in data_iter:
-            input_ids, attention_mask, labels = batch
-            input_ids = input_ids.to(device, non_blocking=True)
-            attention_mask = attention_mask.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            if device.type == 'cuda':
-                with torch.cuda.amp.autocast():
-                    logits = net(input_ids, attention_mask)
-            else:
+            input_ids, attention_mask, labels = move_batch_to_device(batch, device)
+            
+            with torch.cuda.amp.autocast():
                 logits = net(input_ids, attention_mask)
+            
             probs = torch.sigmoid(logits)
             all_probs.append(probs.detach().cpu())
             all_labels.append(labels.detach().cpu())
+    
     probs = torch.cat(all_probs, dim=0).numpy()
     labels = torch.cat(all_labels, dim=0).numpy()
-    return probs, labels
-
-def tune_thresholds_and_metrics(probs, labels):
-    import numpy as np
+    
+    # 计算AUC和F1分数
     num_labels = probs.shape[1]
-    best_thresholds = []
-    per_label_f1 = []
-    aucs = []
+    best_thresholds, per_label_f1, aucs = [], [], []
+    
     for j in range(num_labels):
-        # AUC（可能遇到全负/全正的情形，需保护）
+        # AUC计算
         try:
             auc = roc_auc_score(labels[:, j], probs[:, j])
         except Exception:
             auc = float('nan')
         aucs.append(auc)
-
+        
+        # 最佳阈值和F1分数
         thrs = np.linspace(0.05, 0.95, 37)
         best_t, best_f1 = 0.5, -1.0
-        y_true = labels[:, j]
-        p = probs[:, j]
+        y_true, p = labels[:, j], probs[:, j]
+        
         for t in thrs:
             y_pred = (p >= t).astype(int)
             try:
@@ -392,64 +225,57 @@ def tune_thresholds_and_metrics(probs, labels):
             except Exception:
                 f1 = 0.0
             if f1 > best_f1:
-                best_f1 = f1
-                best_t = t
+                best_f1, best_t = f1, t
+        
         best_thresholds.append(best_t)
         per_label_f1.append(best_f1)
-
-    # 宏平均（忽略 NaN）
+    
+    # 宏平均
     aucs_np = np.array(aucs, dtype=float)
     macro_auc = float(np.nanmean(aucs_np)) if np.isnan(aucs_np).any() else float(aucs_np.mean())
     macro_f1 = float(np.mean(per_label_f1))
-    return macro_auc, macro_f1, best_thresholds
+    
+    return probs, labels, macro_auc, macro_f1, best_thresholds
 
-def train_gpt2_epoch(net, train_iter, loss, updater, device, scheduler=None,progress_bar=None):
+def train_gpt2_epoch(net, train_iter, loss, updater, device, scheduler=None, progress_bar=None, accumulation_steps=1):
     """
-    单个epoch训练 - 混合精度训练 + 学习率调度
+    单个epoch训练 - 混合精度训练 + 学习率调度 + 梯度累积
     """
     net.train()
     metric = Accumulator(3)  # 训练损失总和, 准确数, 样本数
 
     # 使用混合精度训练
-    scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
+    scaler = torch.cuda.amp.GradScaler()
 
     start_time = time.time()
-    for _, batch in enumerate(train_iter):
-        input_ids, attention_mask, labels = batch
-        input_ids = input_ids.to(device, non_blocking=True)
-        attention_mask = attention_mask.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+    for batch_idx, batch in enumerate(train_iter):
+        input_ids, attention_mask, labels = move_batch_to_device(batch, device)
 
         # 混合精度前向传播
-        if scaler is not None:
-            with torch.cuda.amp.autocast():
-                y_hat = net(input_ids, attention_mask)
-                l = loss(y_hat, labels)
-        else:
+        with torch.cuda.amp.autocast():
             y_hat = net(input_ids, attention_mask)
             l = loss(y_hat, labels)
+            # 梯度累积缩放
+            l = l / accumulation_steps
 
-        updater.zero_grad()
+        # 反向传播
+        scaler.scale(l.sum()).backward()
 
-        # 混合精度反向传播
-        if scaler is not None:
-            scaler.scale(l.sum()).backward()
+        # 梯度累积
+        if (batch_idx + 1) % accumulation_steps == 0:
             scaler.unscale_(updater)
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
             scaler.step(updater)
             scaler.update()
-        else:
-            l.sum().backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
-            updater.step()
+            updater.zero_grad()
 
-        # 学习率调度（OneCycleLR需要在每个batch后调用）
-        if scheduler is not None:
-            scheduler.step()
+            # 学习率调度（OneCycleLR需要在每个batch后调用）
+            if scheduler is not None:
+                scheduler.step()
 
         with torch.no_grad():
             acc = multilabel_accuracy(y_hat, labels)
-            metric.add(l.sum(), acc * labels.shape[0], labels.shape[0])
+            metric.add(l.sum() * accumulation_steps, acc * labels.shape[0], labels.shape[0])
 
         cost = time.time() - start_time
         if progress_bar is not None:
@@ -462,16 +288,10 @@ def evaluate_gpt2_accuracy(net, data_iter, device):
     metric = Accumulator(2)
     with torch.no_grad():
         for batch in data_iter:
-            input_ids, attention_mask, labels = batch
-            input_ids = input_ids.to(device, non_blocking=True)
-            attention_mask = attention_mask.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+            input_ids, attention_mask, labels = move_batch_to_device(batch, device)
 
             # 使用混合精度推理
-            if device.type == 'cuda':
-                with torch.cuda.amp.autocast():
-                    y_hat = net(input_ids, attention_mask)
-            else:
+            with torch.cuda.amp.autocast():
                 y_hat = net(input_ids, attention_mask)
 
             acc = multilabel_accuracy(y_hat, labels)
@@ -499,14 +319,13 @@ def train_gpt2_model(net, train_iter, val_iter, loss, trainer, num_epochs, devic
                             desc=f"Epoch {epoch+1}/{num_epochs}",
                             bar_format="{desc}: {n_fmt}/{total_fmt} {postfix}")
 
-        # 训练
+        # 训练 (添加梯度累积)
         train_loss, train_acc = train_gpt2_epoch(
-            net, train_iter_tqdm, loss, trainer, device, scheduler,train_iter_tqdm
+            net, train_iter_tqdm, loss, trainer, device, scheduler, train_iter_tqdm, GRADIENT_ACCUMULATION_STEPS
         )
 
         # 验证
-        val_probs, val_labels = collect_probs_and_labels(net, val_iter, device)
-        macro_auc, macro_f1, best_thrs = tune_thresholds_and_metrics(val_probs, val_labels)
+        val_probs, val_labels, macro_auc, macro_f1, best_thrs = evaluate_model_metrics(net, val_iter, device)
 
         tqdm.write(
             f'Epoch {epoch + 1}: '
@@ -534,76 +353,87 @@ def train_gpt2_model(net, train_iter, val_iter, loss, trainer, num_epochs, devic
     print(f'Final: best val macro AUC {best_auc:.4f}')
 
 
-# ============ 主要执行代码 ============
-print("🚀 启动双向GPT2多标签分类训练")
+# 主执行代码
+print("🚀 启动GPT2多标签分类训练")
+
+# 配置参数 - 可根据需要调整
+MAX_LENGTH = 128  # 最大序列长度
+BATCH_SIZE = 64   # 批次大小 (优化: 32 → 64)
+NUM_EPOCHS = 3    # 训练轮数
+UNFREEZE_LAYERS = 2  # 解冻的顶层层数
+GRADIENT_ACCUMULATION_STEPS = 2  # 梯度累积步数
 
 # 设备配置
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f'🔥 使用设备: {device}')
+batch_size = BATCH_SIZE if torch.cuda.is_available() else 16
+num_epochs = NUM_EPOCHS
 
-# 模型参数 - 优化以提升训练速度
-num_classes = 6  # 6个类别：toxic, severe_toxic, obscene, threat, insult, identity_hate
-# 根据GPU情况自动调整批次大小
-batch_size = 32 if torch.cuda.is_available() else 16
-num_steps = 128   # 序列长度（从128降到64）
-lr = 2e-3        # 提高学习率以加快收敛
-num_epochs = 3   # 训练轮数
+print(f"📊 配置信息:")
+print(f"  最大序列长度: {MAX_LENGTH}")
+print(f"  批次大小: {batch_size}")
+print(f"  训练轮数: {num_epochs}")
+print(f"  解冻层数: {UNFREEZE_LAYERS}")
+print(f"  梯度累积步数: {GRADIENT_ACCUMULATION_STEPS}")
 
-train_iter, val_iter, test_iter, test_ids =  create_dataloaders(data_dir,batch_size)
+# 数据加载
+train_iter, val_iter, test_iter, test_ids = create_dataloaders(data_dir, batch_size, MAX_LENGTH)
 
+# 模型
 net = GPT2ClassificationModel()
-print(f"模型参数数量: {sum(p.numel() for p in net.parameters()):,}")
 net.to(device)
+unfreeze_gpt2_top_k_layers(net, k=UNFREEZE_LAYERS)
 
-# --- 解冻策略：只解冻顶层若干层（其余冻结） ---
-UNFREEZE_TOP_K = 2  # 修改此值控制解冻的顶层 block 数量；0 表示仅训练分类头
-unfreeze_gpt2_top_k_layers(net, k=UNFREEZE_TOP_K)
-trainable_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-print(f"可训练参数数量: {trainable_params:,} (解冻顶层 {UNFREEZE_TOP_K} 层)")
-# ------------------------------------
+# 模型编译优化 (PyTorch 2.0+)
+if hasattr(torch, 'compile'):
+    try:
+        net = torch.compile(net, mode="reduce-overhead")
+        print("✅ 启用模型编译优化")
+    except Exception as e:
+        print(f"⚠️  模型编译失败: {e}")
 
+# 梯度检查点优化
+try:
+    net.gpt2.gradient_checkpointing_enable()
+    print("✅ 启用梯度检查点")
+except Exception:
+    pass
 
+print(f"可训练参数: {sum(p.numel() for p in net.parameters() if p.requires_grad):,}")
+
+# 优化器
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 
-# 优化器（分组学习率）：骨干较小 LR，分类头较大 LR
-base_params = []
-head_params = []
-for n, p in net.named_parameters():
-    if not p.requires_grad:
-        continue
-    (head_params if "classifier" in n else base_params).append(p)
+# 优化器配置
+base_params = [p for n, p in net.named_parameters() if p.requires_grad and "classifier" not in n]
+head_params = [p for n, p in net.named_parameters() if p.requires_grad and "classifier" in n]
 
 trainer = AdamW([
     {"params": base_params, "lr": 5e-5},
     {"params": head_params, "lr": 1e-3},
 ], weight_decay=0.01)
 
-# 线性 warmup + 线性衰减（10% 预热）
+# 学习率调度
 num_training_steps = len(train_iter) * num_epochs
 num_warmup_steps = max(1, int(0.1 * num_training_steps))
 scheduler = get_linear_schedule_with_warmup(trainer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps)
 
-# 损失函数 - 计算 pos_weight 以缓解类不平衡
+# 损失函数
 train_labels_array = np.array(train_iter.dataset.labels)
 pos = train_labels_array.sum(axis=0)
 neg = len(train_labels_array) - pos
 pos_weight = torch.tensor((neg / (pos + 1e-6)).tolist(), dtype=torch.float).to(device)
 loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction="none")
 
-
-# 启用稳定性选项
+# 训练
 net.gpt2.config.use_cache = False
 try:
     net.gpt2.gradient_checkpointing_enable()
 except Exception:
     pass
 
-# 开始训练
 train_gpt2_model(net, train_iter, val_iter, loss, trainer, num_epochs, device, scheduler)
-
-print("\n" + "="*60)
-print("🎉 Huggingface GPT2 多标签分类 训练完成!")
+print("🎉 训练完成!")
 
 
 import time
@@ -621,15 +451,10 @@ def generate_submission(model, test_loader, device, test_ids, output_path):
 
         for i, batch in enumerate(test_loader_tqdm):
             try:
-                input_ids, attention_mask, _ = batch
-                input_ids = input_ids.to(device, non_blocking=True)
-                attention_mask = attention_mask.to(device, non_blocking=True)
+                input_ids, attention_mask = move_batch_to_device(batch, device, has_labels=False)
 
                 # 使用混合精度推理
-                if device.type == 'cuda':
-                    with torch.cuda.amp.autocast():
-                        logits = model(input_ids, attention_mask)
-                else:
+                with torch.cuda.amp.autocast():
                     logits = model(input_ids, attention_mask)
 
                 probs = torch.sigmoid(logits).cpu().numpy()
@@ -664,9 +489,7 @@ def generate_submission(model, test_loader, device, test_ids, output_path):
 
     return submission_df
 
-    # 生成提交文件
+# 生成提交文件
 submission_path = os.path.join(data_dir, 'submission.csv')
 submission_df = generate_submission(net, test_iter, device, test_ids, submission_path)
-
-print("\n🎉 训练和预测完成!")
 print(f"✅ 提交文件: {submission_path}")
