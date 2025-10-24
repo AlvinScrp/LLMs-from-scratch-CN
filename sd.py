@@ -1,4 +1,5 @@
 import os
+import math
 import urllib.request
 from pathlib import Path
 import re
@@ -9,7 +10,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
 from transformers import GPT2Tokenizer, GPT2Model
-from sklearn.metrics import roc_auc_score, f1_score
+from sklearn.metrics import roc_auc_score, f1_score, precision_recall_curve
 from tqdm import tqdm
 import time
 import warnings
@@ -74,7 +75,8 @@ def create_dataloaders(data_dir, batch_size, max_length=128):
     # 添加标签
     label_cols = ['toxic', 'severe_toxic', 'obscene', 'threat', 'insult', 'identity_hate']
     def add_labels(examples):
-        return {'labels': [[examples[col][i] for col in label_cols] for i in range(len(examples['id']))]}
+        labels = [[float(examples[col][i]) for col in label_cols] for i in range(len(examples['id']))]
+        return {'labels': labels}
     
     train_dataset = train_dataset.map(add_labels, batched=True)
     val_dataset = val_dataset.map(add_labels, batched=True)
@@ -162,12 +164,11 @@ def try_all_gpus():
 
 def move_batch_to_device(batch, device, has_labels=True):
     """将批次数据移动到指定设备"""
-    input_ids, attention_mask = batch[:2]
-    input_ids = input_ids.to(device, non_blocking=True)
-    attention_mask = attention_mask.to(device, non_blocking=True)
+    input_ids = batch['input_ids'].to(device, non_blocking=True)
+    attention_mask = batch['attention_mask'].to(device, non_blocking=True)
     
-    if has_labels and len(batch) > 2:
-        labels = batch[2].to(device, non_blocking=True)
+    if has_labels and 'labels' in batch:
+        labels = batch['labels'].to(device, non_blocking=True)
         return input_ids, attention_mask, labels
     else:
         return input_ids, attention_mask
@@ -212,21 +213,22 @@ def evaluate_model_metrics(net, data_iter, device):
         except Exception:
             auc = float('nan')
         aucs.append(auc)
-        
-        # 最佳阈值和F1分数
-        thrs = np.linspace(0.05, 0.95, 37)
-        best_t, best_f1 = 0.5, -1.0
+
+        # 使用精确率-召回率曲线寻找能最大化F1的阈值（比固定网格更精细）
         y_true, p = labels[:, j], probs[:, j]
-        
-        for t in thrs:
-            y_pred = (p >= t).astype(int)
-            try:
-                f1 = f1_score(y_true, y_pred, zero_division=0)
-            except Exception:
-                f1 = 0.0
-            if f1 > best_f1:
-                best_f1, best_t = f1, t
-        
+        try:
+            precision, recall, pr_thresholds = precision_recall_curve(y_true, p)
+            f1s = (2 * precision * recall) / (precision + recall + 1e-8)
+            best_idx = int(np.nanargmax(f1s))
+            best_f1 = float(f1s[best_idx])
+            # pr_thresholds长度为len(precision)-1，与precision/recall对齐
+            if best_idx == 0:
+                best_t = float(0.5)  # 当best_idx为0时阈值未定义，回退到0.5
+            else:
+                best_t = float(pr_thresholds[best_idx - 1])
+        except Exception:
+            best_t, best_f1 = 0.5, 0.0
+
         best_thresholds.append(best_t)
         per_label_f1.append(best_f1)
     
@@ -237,7 +239,7 @@ def evaluate_model_metrics(net, data_iter, device):
     
     return probs, labels, macro_auc, macro_f1, best_thresholds
 
-def train_gpt2_epoch(net, train_iter, loss, updater, device, scheduler=None, progress_bar=None, accumulation_steps=1):
+def train_gpt2_epoch(net, train_iter, loss, updater, device, scheduler=None, progress_bar=None, accumulation_steps=1, log_interval=50):
     """
     单个epoch训练 - 混合精度训练 + 学习率调度 + 梯度累积
     """
@@ -254,6 +256,8 @@ def train_gpt2_epoch(net, train_iter, loss, updater, device, scheduler=None, pro
         # 混合精度前向传播
         with torch.cuda.amp.autocast():
             y_hat = net(input_ids, attention_mask)
+            # 确保标签是浮点类型
+            labels = labels.float()
             l = loss(y_hat, labels)
             # 梯度累积缩放
             l = l / accumulation_steps
@@ -278,7 +282,7 @@ def train_gpt2_epoch(net, train_iter, loss, updater, device, scheduler=None, pro
             metric.add(l.sum() * accumulation_steps, acc * labels.shape[0], labels.shape[0])
 
         cost = time.time() - start_time
-        if progress_bar is not None:
+        if progress_bar is not None and ((batch_idx + 1) % log_interval == 0):
             progress_bar.set_postfix({"Cost": f"{cost:.2f}s"})
 
     return metric[0] / metric[2], metric[1] / metric[2]
@@ -294,11 +298,13 @@ def evaluate_gpt2_accuracy(net, data_iter, device):
             with torch.cuda.amp.autocast():
                 y_hat = net(input_ids, attention_mask)
 
+            # 确保标签是浮点类型
+            labels = labels.float()
             acc = multilabel_accuracy(y_hat, labels)
             metric.add(acc * labels.shape[0], labels.shape[0])
     return metric[0] / metric[1]
 
-def train_gpt2_model(net, train_iter, val_iter, loss, trainer, num_epochs, devices, scheduler=None, patience=2):
+def train_gpt2_model(net, train_iter, val_iter, loss, trainer, num_epochs, devices, scheduler=None, patience=3):
     """
     完整训练流程
     """
@@ -311,17 +317,19 @@ def train_gpt2_model(net, train_iter, val_iter, loss, trainer, num_epochs, devic
     device = devices[0] if isinstance(devices, list) else devices
     net = net.to(device)
 
-    best_auc = -1.0
+    best_f1 = -1.0
     best_state = None
+    best_thresholds = None
     epochs_no_improve = 0
     for epoch in range(num_epochs):
         train_iter_tqdm = tqdm(train_iter,
                             desc=f"Epoch {epoch+1}/{num_epochs}",
-                            bar_format="{desc}: {n_fmt}/{total_fmt} {postfix}")
+                            bar_format="{desc}: {n_fmt}/{total_fmt} {postfix}",
+                            mininterval=1.0)
 
         # 训练 (添加梯度累积)
         train_loss, train_acc = train_gpt2_epoch(
-            net, train_iter_tqdm, loss, trainer, device, scheduler, train_iter_tqdm, GRADIENT_ACCUMULATION_STEPS
+            net, train_iter_tqdm, loss, trainer, device, scheduler, train_iter_tqdm, GRADIENT_ACCUMULATION_STEPS, log_interval=50
         )
 
         # 验证
@@ -336,21 +344,23 @@ def train_gpt2_model(net, train_iter, val_iter, loss, trainer, num_epochs, devic
             f'lr {trainer.param_groups[0]["lr"]:.6f}'
         )
 
-        # Early stopping on macro AUC
-        if macro_auc > best_auc:
-            best_auc = macro_auc
+        # Early stopping & best checkpoint based on macro F1
+        if macro_f1 > best_f1:
+            best_f1 = macro_f1
             best_state = {k: v.cpu().clone() for k, v in net.state_dict().items()}
+            best_thresholds = best_thrs
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
-                tqdm.write(f"Early stopping at epoch {epoch + 1} (best macro AUC {best_auc:.4f})")
+                tqdm.write(f"Early stopping at epoch {epoch + 1} (best macro F1 {best_f1:.4f})")
                 break
 
     # print(f'Training completed in {timer.stop():.1f} sec')
     if best_state is not None:
         net.load_state_dict(best_state)
-    print(f'Final: best val macro AUC {best_auc:.4f}')
+    print(f'Final: best val macro F1 {best_f1:.4f}')
+    return best_thresholds
 
 
 # 主执行代码
@@ -359,9 +369,12 @@ print("🚀 启动GPT2多标签分类训练")
 # 配置参数 - 可根据需要调整
 MAX_LENGTH = 128  # 最大序列长度
 BATCH_SIZE = 64   # 批次大小 (优化: 32 → 64)
-NUM_EPOCHS = 3    # 训练轮数
-UNFREEZE_LAYERS = 2  # 解冻的顶层层数
-GRADIENT_ACCUMULATION_STEPS = 2  # 梯度累积步数
+NUM_EPOCHS = 10  # 训练轮数
+UNFREEZE_LAYERS = 8  # 解冻的顶层层数（进一步提升可训练容量）
+GRADIENT_ACCUMULATION_STEPS = 1  # 梯度累积步数
+WARMUP_FRACTION = 0.05   # 学习率warmup占比（5%）
+MIN_LR_FACTOR = 0.2      # 学习率下限=初始lr的20%（放慢后期衰减）
+DECAY_POWER = 2.0        # 余弦退火的进度幂次（>1 放慢前期下降）
 
 # 设备配置
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -373,6 +386,9 @@ print(f"  最大序列长度: {MAX_LENGTH}")
 print(f"  批次大小: {batch_size}")
 print(f"  训练轮数: {num_epochs}")
 print(f"  解冻层数: {UNFREEZE_LAYERS}")
+print(f"  Warmup占比: {WARMUP_FRACTION}")
+print(f"  LR下限比例: {MIN_LR_FACTOR}")
+print(f"  衰减曲线幂次: {DECAY_POWER}")
 print(f"  梯度累积步数: {GRADIENT_ACCUMULATION_STEPS}")
 
 # 数据加载
@@ -402,28 +418,42 @@ print(f"可训练参数: {sum(p.numel() for p in net.parameters() if p.requires_
 
 # 优化器
 from torch.optim import AdamW
-from transformers import get_linear_schedule_with_warmup
+from torch.optim.lr_scheduler import LambdaLR
 
 # 优化器配置
 base_params = [p for n, p in net.named_parameters() if p.requires_grad and "classifier" not in n]
 head_params = [p for n, p in net.named_parameters() if p.requires_grad and "classifier" in n]
 
 trainer = AdamW([
-    {"params": base_params, "lr": 5e-5},
-    {"params": head_params, "lr": 1e-3},
+    {"params": base_params, "lr": 1e-4},   # 提高基座学习率
+    {"params": head_params, "lr": 2e-3},   # 提高分类头学习率
 ], weight_decay=0.01)
 
-# 学习率调度
-num_training_steps = len(train_iter) * num_epochs
-num_warmup_steps = max(1, int(0.1 * num_training_steps))
-scheduler = get_linear_schedule_with_warmup(trainer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps)
+# 学习率调度：Warmup + 余弦退火到下限（按优化器step次数计算）
+total_optimizer_steps = max(1, (len(train_iter) * num_epochs) // max(1, GRADIENT_ACCUMULATION_STEPS))
+warmup_steps = max(1, int(WARMUP_FRACTION * total_optimizer_steps))
 
-# 损失函数
-train_labels_array = np.array(train_iter.dataset.labels)
+def lr_lambda(current_step: int) -> float:
+    # warmup阶段：线性从0→1
+    if current_step < warmup_steps:
+        return float(current_step) / float(max(1, warmup_steps))
+    # 余弦退火阶段：从1退火到MIN_LR_FACTOR
+    progress = (current_step - warmup_steps) / float(max(1, total_optimizer_steps - warmup_steps))
+    progress = min(1.0, max(0.0, progress)) ** DECAY_POWER  # 幂次塑形：>1 放慢前期下降
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return float(MIN_LR_FACTOR + (1.0 - MIN_LR_FACTOR) * cosine)
+
+scheduler = LambdaLR(trainer, lr_lambda)
+
+# 损失函数 - 从数据集中提取标签
+print("📊 计算类别权重...")
+# 使用批量访问提高效率
+train_labels_array = np.array(train_iter.dataset['labels'])
 pos = train_labels_array.sum(axis=0)
 neg = len(train_labels_array) - pos
 pos_weight = torch.tensor((neg / (pos + 1e-6)).tolist(), dtype=torch.float).to(device)
 loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction="none")
+print(f"✅ 类别权重计算完成: {pos_weight.cpu().numpy()}")
 
 # 训练
 net.gpt2.config.use_cache = False
@@ -432,22 +462,22 @@ try:
 except Exception:
     pass
 
-train_gpt2_model(net, train_iter, val_iter, loss, trainer, num_epochs, device, scheduler)
+best_thresholds = train_gpt2_model(net, train_iter, val_iter, loss, trainer, num_epochs, device, scheduler)
 print("🎉 训练完成!")
 
 
 import time
-def generate_submission(model, test_loader, device, test_ids, output_path):
+def generate_submission(model, test_loader, device, test_ids, output_path, thresholds=None):
     """
     生成Kaggle提交文件
     """
     model.eval()
-    predictions = []
+    predictions = []  # list of (batch_size, num_labels) numpy arrays
 
     print("🔮 生成预测结果...")
     with torch.no_grad():
         start_time = time.time()
-        test_loader_tqdm = tqdm(test_loader,bar_format=" {n_fmt}/{total_fmt} {postfix}")
+        test_loader_tqdm = tqdm(test_loader, bar_format=" {n_fmt}/{total_fmt} {postfix}", mininterval=1.0)
 
         for i, batch in enumerate(test_loader_tqdm):
             try:
@@ -457,8 +487,8 @@ def generate_submission(model, test_loader, device, test_ids, output_path):
                 with torch.cuda.amp.autocast():
                     logits = model(input_ids, attention_mask)
 
-                probs = torch.sigmoid(logits).cpu().numpy()
-                predictions.extend(probs)
+                probs = torch.sigmoid(logits).cpu().numpy()  # (B, C)
+                predictions.append(probs)
                 cost = time.time() - start_time
                 test_loader_tqdm.set_postfix({"Cost": f"{cost:.2f}s"})
             except Exception as e:
@@ -471,13 +501,32 @@ def generate_submission(model, test_loader, device, test_ids, output_path):
                         print(f"  非tensor[{j}]: {type(item)}")
                 raise e
 
+    # 拼接预测为 (N, C)
+    if len(predictions) == 0:
+        raise RuntimeError("未生成任何预测结果，predictions 为空")
+    preds_array = np.vstack(predictions).astype(float)  # (N, C)
+
+    # 对齐长度，防止长度不一致导致空值
+    n = min(len(test_ids), preds_array.shape[0])
+    if n != len(test_ids) or n != preds_array.shape[0]:
+        print(f"⚠️  预测行数({preds_array.shape[0]})与test_ids({len(test_ids)})不一致，将按较小长度{n}对齐")
+    test_ids = list(test_ids)[:n]
+    preds_array = preds_array[:n]
+
+    # 应用阈值（可选），并保证为float
+    if thresholds is not None:
+        thr = np.array(thresholds, dtype=float).reshape(1, -1)  # (1, C)
+        preds_array = (preds_array >= thr).astype(float)
+
+    # 清理数值中的NaN/Inf，避免空值写入CSV
+    preds_array = np.nan_to_num(preds_array, nan=0.0, posinf=1.0, neginf=0.0)
 
     # 创建提交DataFrame
     label_columns = ['toxic', 'severe_toxic', 'obscene', 'threat', 'insult', 'identity_hate']
-    submission_df = pd.DataFrame({
-        'id': test_ids,
-        **{col: [pred[i] for pred in predictions] for i, col in enumerate(label_columns)}
-    })
+    data_dict = {'id': test_ids}
+    for i, col in enumerate(label_columns):
+        data_dict[col] = preds_array[:, i].astype(float)
+    submission_df = pd.DataFrame(data_dict)
 
     # 保存提交文件
     submission_df.to_csv(output_path, index=False)
@@ -491,5 +540,5 @@ def generate_submission(model, test_loader, device, test_ids, output_path):
 
 # 生成提交文件
 submission_path = os.path.join(data_dir, 'submission.csv')
-submission_df = generate_submission(net, test_iter, device, test_ids, submission_path)
+submission_df = generate_submission(net, test_iter, device, test_ids, submission_path, thresholds=None)
 print(f"✅ 提交文件: {submission_path}")
