@@ -1,22 +1,103 @@
 import os
-import math
 import urllib.request
 from pathlib import Path
 import re
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
-from transformers import GPT2Tokenizer, GPT2Model
-from sklearn.metrics import roc_auc_score, f1_score, precision_recall_curve
+from transformers import GPT2Tokenizer, GPT2Model, DataCollatorWithPadding
 from tqdm import tqdm
 import time
 import warnings
 import datasets
 
 warnings.filterwarnings('ignore')
+
+# ========= 文本清洗规则（来自：优化数据comment_text.md） =========
+CHARS_TO_REMOVE = '!"#$%&()*+,-./:;<=>?@[\\]^_`{|}~\t\n“”’\'∞θ÷α•à−β∅³π‘₹´°£€\×™√²—'
+# We will filter all characters except alphabet characters and some punctuation
+valid_characters = " " + "@$" + "'!?-" + "abcdefghijklmnopqrstuvwxyz" + "abcdefghijklmnopqrstuvwxyz".upper()
+valid_characters_ext = valid_characters + "abcdefghijklmnopqrstuvwxyz".upper()
+
+# 直接判定词（当前不直接用于打标签，仅用于清洗参考）
+TOXIC_WORDS = [
+    "poop", "crap", "prick", "twat", "wikipedia", "wiki", "hahahahaha", "lol",
+    "bastard", "sluts", "slut", "douchebag", "douche", "blowjob", "nigga", "dumb",
+    "jerk", "wanker", "wank", "penis", "motherfucker", "fucker", "fuk", "fucking",
+    "fucked", "fuck", "bullshit", "shit", "stupid", "bitches", "bitch", "suck",
+    "cunt", "dick", "cocks", "cock", "die", "kill", "gay", "jewish", "jews", "jew",
+    "niggers", "nigger", "faggot", "fag", "asshole"
+]
+
+# 星号替换词对（前者→后者）
+ASTERICKS_WORDS = [
+    ('mother****ers', 'motherfuckers'), ('motherf*cking', 'motherfucking'),
+    ('mother****er', 'motherfucker'), ('motherf*cker', 'motherfucker'),
+    ('bullsh*t', 'bullshit'), ('f**cking', 'fucking'), ('f*ucking', 'fucking'),
+    ('fu*cking', 'fucking'), ('****ing', 'fucking'), ('a**hole', 'asshole'),
+    ('assh*le', 'asshole'), ('f******', 'fucking'), ('f*****g', 'fucking'),
+    ('f***ing', 'fucking'), ('f**king', 'fucking'), ('f*cking', 'fucking'),
+    ('fu**ing', 'fucking'), ('fu*king', 'fucking'), ('fuc*ers', 'fuckers'),
+    ('f*****', 'fucking'), ('f***ed', 'fucked'), ('f**ker', 'fucker'),
+    ('f*cked', 'fucked'), ('f*cker', 'fucker'), ('f*ckin', 'fucking'),
+    ('fu*ker', 'fucker'), ('fuc**n', 'fucking'), ('ni**as', 'niggas'),
+    ('b**ch', 'bitch'), ('b*tch', 'bitch'), ('c*unt', 'cunt'), ('f**ks', 'fucks'),
+    ('f*ing', 'fucking'), ('ni**a', 'nigga'), ('c*ck', 'cock'), ('c*nt', 'cunt'),
+    ('cr*p', 'crap'), ('d*ck', 'dick'), ('f***', 'fuck'), ('f**k', 'fuck'),
+    ('f*ck', 'fuck'), ('fc*k', 'fuck'), ('fu**', 'fuck'), ('fu*k', 'fuck'),
+    ('s***', 'shit'), ('s**t', 'shit'), ('sh**', 'shit'), ('sh*t', 'shit'), ('tw*t', 'twat')
+]
+
+# fastText 拼写归一
+FASTTEXT_MISSPELLINGS = {"'n'balls": 'balls', "-nazi's": 'nazis', 'adminabuse': 'admin abuse', "admins's": 'admins', 'arsewipe': 'arse wipe', 'assfack': 'asshole', 'assholifity': 'asshole', 'assholivity': 'asshole', 'asshoul': 'asshole', 'asssholeee': 'asshole', 'belizeans': 'mexicans', "blowing's": 'blowing', 'bolivians': 'mexicans', 'celtofascists': 'fascists', 'censorshipmeisters': 'censor', 'chileans': 'mexicans', 'clerofascist': 'fascist', 'cowcrap': 'crap', 'crapity': 'crap', "d'idiots": 'idiots', 'deminazi': 'nazi', 'dftt': "don't feed the troll", 'dildohs': 'dildo', 'dramawhores': 'drama whores', 'edophiles': 'pedophiles', 'eurocommunist': 'communist', 'faggotkike': 'faggot', 'fantard': 'retard', 'fascismnazism': 'fascism', 'fascistisized': 'fascist', 'favremother': 'mother', 'fuxxxin': 'fucking', "g'damn": 'goddamn', 'harassmentat': 'harassment', 'harrasingme': 'harassing me', 'herfuc': 'motherfucker', 'hilterism': 'fascism', 'hitlerians': 'nazis', 'hitlerites': 'nazis', 'hubrises': 'pricks', 'idiotizing': 'idiotic', 'inadvandals': 'vandals', "jackass's": 'jackass', 'jiggabo': 'nigga', 'jizzballs': 'jizz balls', 'jmbass': 'dumbass', 'lejittament': 'legitimate', "m'igger": 'nigger', "m'iggers": 'niggers', 'motherfacking': 'motherfucker', 'motherfuckenkiwi': 'motherfucker', 'muthafuggas': 'niggas', 'nazisms': 'nazis', 'netsnipenigger': 'nigger', 'niggercock': 'nigger', 'niggerspic': 'nigger', 'nignog': 'nigga', 'niqqass': 'niggas', "non-nazi's": 'not a nazi', 'panamanians': 'mexicans', 'pedidiots': 'idiots', 'picohitlers': 'hitler', 'pidiots': 'idiots', 'poopia': 'poop', 'poopsies': 'poop', 'presumingly': 'obviously', 'propagandaanddisinformation': 'propaganda and disinformation', 'propagandaministerium': 'propaganda', 'puertoricans': 'mexicans', 'puertorricans': 'mexicans', 'pussiest': 'pussies', 'pussyitis': 'pussy', 'rayaridiculous': 'ridiculous', 'redfascists': 'fascists', 'retardzzzuuufff': 'retard', "revertin'im": 'reverting', 'scumstreona': 'scums', 'southamericans': 'mexicans', 'strasserism': 'fascism', 'stuptarded': 'retarded', "t'nonsense": 'nonsense', "threatt's": 'threat', 'titoists': 'communists', 'twatbags': 'douchebags', 'youbollocks': 'you bollocks'}
+
+# 收缩词展开
+CONT_PATTERNS = [
+    (r'(W|w)on\'t', r'will not'),
+    (r'(C|c)an\'t', r'can not'),
+    (r'(I|i)\'m', r'i am'),
+    (r'(A|a)in\'t', r'is not'),
+    (r'(\w+)\'ll', r'\g<1> will'),
+    (r'(\w+)n\'t', r'\g<1> not'),
+    (r'(\w+)\'ve', r'\g<1> have'),
+    (r'(\w+)\'s', r'\g<1> is'),
+    (r'(\w+)\'re', r'\g<1> are'),
+    (r'(\w+)\'d', r'\g<1> would'),
+]
+
+def normalize_text(text: str) -> str:
+    if text is None or (isinstance(text, float) and np.isnan(text)):
+        return ""
+    s = str(text)
+    s = s.strip().lower()
+    # 处理不间断空格 \xa0
+    s = s.replace("\xa0", " ")
+
+    # 展开收缩词
+    for pattern, repl in CONT_PATTERNS:
+        s = re.sub(pattern, repl, s)
+
+    # 星号变体归一
+    for bad, good in ASTERICKS_WORDS:
+        s = s.replace(bad, good)
+
+    # fastText 拼写归一（按词边界）
+    for bad, good in FASTTEXT_MISSPELLINGS.items():
+        s = re.sub(rf'\b{re.escape(bad)}\b', good, s)
+
+    # 去除特殊字符（替换为空格，保留分词边界）
+    trans = {ord(c): " " for c in CHARS_TO_REMOVE}
+    s = s.translate(trans)
+
+    # 允许字符白名单过滤（不在白名单的字符替换为空格）
+    allowed = set(valid_characters_ext)
+    s = ''.join(ch if ch in allowed else ' ' for ch in s)
+
+    # 合并多空格
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
 
 # 全局配置
 URLPrefix = "https://pro-5gu0t2os8cdd45f2-1251420592.tcloudbaseapp.com/toxic-comment-classification"
@@ -46,8 +127,11 @@ def create_dataloaders(data_dir, batch_size, max_length=128):
     prepare_csv_list()
     
     # 读取数据
-    train_df = pd.read_csv(DATA_DIR / "train.csv")
-    test_df = pd.read_csv(DATA_DIR / "test.csv")
+    label_cols = ['toxic', 'severe_toxic', 'obscene', 'threat', 'insult', 'identity_hate']
+    usecols_train = ['id', 'comment_text'] + label_cols
+    usecols_test = ['id', 'comment_text']
+    train_df = pd.read_csv(DATA_DIR / "train.csv", usecols=usecols_train)
+    test_df = pd.read_csv(DATA_DIR / "test.csv", usecols=usecols_test)
     
     # 分割验证集
     val_split = int(len(train_df) * 0.8)
@@ -63,17 +147,26 @@ def create_dataloaders(data_dir, batch_size, max_length=128):
     
     # 预处理函数
     def preprocess_batch(examples):
-        texts = [str(text).strip() if not pd.isna(text) else "" for text in examples['comment_text']]
-        tokenized = tokenizer(texts, truncation=True, padding='max_length', max_length=max_length, return_tensors=None)
+        texts = [normalize_text(text) for text in examples['comment_text']]
+        # 动态 padding：此处不填充，只截断；由 collator 在 DataLoader 内按 batch 最长填充
+        tokenized = tokenizer(
+            texts,
+            truncation=True,
+            max_length=max_length,
+            padding=False,
+            return_tensors=None,
+        )
         return {'input_ids': tokenized['input_ids'], 'attention_mask': tokenized['attention_mask']}
     
-    # 创建数据集
-    train_dataset = datasets.Dataset.from_pandas(train_df).map(preprocess_batch, batched=True, batch_size=1000, num_proc=4)
-    val_dataset = datasets.Dataset.from_pandas(val_df).map(preprocess_batch, batched=True, batch_size=1000, num_proc=4)
-    test_dataset = datasets.Dataset.from_pandas(test_df).map(preprocess_batch, batched=True, batch_size=1000, num_proc=4)
+    # 创建数据集（可并行映射）
+    cpu_cnt = os.cpu_count() or 2
+    MAP_NUM_PROC = min(4, max(1, cpu_cnt // 2))  # 适度并行，避免过载
+    train_dataset = datasets.Dataset.from_pandas(train_df).map(preprocess_batch, batched=True, batch_size=1000, num_proc=MAP_NUM_PROC)
+    val_dataset = datasets.Dataset.from_pandas(val_df).map(preprocess_batch, batched=True, batch_size=1000, num_proc=MAP_NUM_PROC)
+    test_dataset = datasets.Dataset.from_pandas(test_df).map(preprocess_batch, batched=True, batch_size=1000, num_proc=MAP_NUM_PROC)
     
     # 添加标签
-    label_cols = ['toxic', 'severe_toxic', 'obscene', 'threat', 'insult', 'identity_hate']
+    # 添加标签
     def add_labels(examples):
         labels = [[float(examples[col][i]) for col in label_cols] for i in range(len(examples['id']))]
         return {'labels': labels}
@@ -81,15 +174,60 @@ def create_dataloaders(data_dir, batch_size, max_length=128):
     train_dataset = train_dataset.map(add_labels, batched=True)
     val_dataset = val_dataset.map(add_labels, batched=True)
     
-    # 设置格式
-    train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
-    val_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
-    test_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask'])
+    # 仅保留模型需要的列，避免 collator 看到字符串/列表等无法转张量的字段
+    keep_train_cols = ['input_ids', 'attention_mask', 'labels']
+    keep_val_cols = ['input_ids', 'attention_mask', 'labels']
+    keep_test_cols = ['input_ids', 'attention_mask']
+    train_dataset = train_dataset.remove_columns([c for c in train_dataset.column_names if c not in keep_train_cols])
+    val_dataset = val_dataset.remove_columns([c for c in val_dataset.column_names if c not in keep_val_cols])
+    test_dataset = test_dataset.remove_columns([c for c in test_dataset.column_names if c not in keep_test_cols])
+
+    # 不将数据集预先转换为 torch；交由 collator 动态 padding 并转换
     
-    # 创建数据加载器 (优化: 增加工作进程和预取因子)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=4)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=4)
+    # DataCollator：按 batch 最长动态 padding，8 对齐以加速 Tensor Core
+    collator = DataCollatorWithPadding(tokenizer=tokenizer, padding='longest', pad_to_multiple_of=8, return_tensors='pt')
+
+    def collate_fn(features):
+        labels = None
+        if 'labels' in features[0]:
+            labels = [f['labels'] for f in features]
+            for f in features:
+                f.pop('labels', None)
+        batch = collator(features)
+        if labels is not None:
+            batch['labels'] = torch.tensor(labels, dtype=torch.float)
+        return batch
+
+    # 创建数据加载器（单进程，更稳）
+    NUM_WORKERS_TRAIN = 0
+    NUM_WORKERS_EVAL = 0
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=NUM_WORKERS_TRAIN,
+        pin_memory=True,
+        drop_last=True,
+        collate_fn=collate_fn,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=NUM_WORKERS_EVAL,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=NUM_WORKERS_EVAL,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
+
+    print(f"🧵 DataLoader workers -> train/val/test: 0")
     
     return train_loader, val_loader, test_loader, test_df['id'].tolist()
 
@@ -112,22 +250,16 @@ class GPT2ClassificationModel(nn.Module):
     logits = self.classifier(self.dropout(pooled))
     return logits
 
-# ====== 解冻控制：只解冻顶层若干层 ======
+# 冻结所有层，仅解冻顶层 k 个 Transformer block（以及最终层归一化与分类头）
 def unfreeze_gpt2_top_k_layers(model: GPT2ClassificationModel, k: int) -> None:
-    """冻结 GPT-2 全部层后，仅解冻顶层 k 个 block（以及最终层归一化与分类头）。
-
-    Args:
-        model: 包含 GPT-2 的分类模型
-        k: 需要解冻的顶层 block 数量（k<=总层数）。k<=0 表示只训练分类头
-    """
-    # 冻结全部 GPT-2 参数
+    # 先冻结全部 GPT-2 参数
     for p in model.gpt2.parameters():
         p.requires_grad = False
 
-    # 仅解冻顶层 k 个 block
+    # 解冻顶层 k 个 block
+    total_blocks = len(model.gpt2.h)
+    k = max(0, min(k, total_blocks))
     if k > 0:
-        total_blocks = len(model.gpt2.h)
-        k = min(k, total_blocks)
         for block in model.gpt2.h[-k:]:
             for p in block.parameters():
                 p.requires_grad = True
@@ -151,15 +283,9 @@ class Accumulator:
         return self.data[idx]
 
 class Timer:
-    def __init__(self):
-        import time
-        self.time = time
-        self.start_time = self.time.time()
-    def stop(self):
-        return self.time.time() - self.start_time
+    pass
 
 def try_all_gpus():
-    """检测可用GPU"""
     return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def move_batch_to_device(batch, device, has_labels=True):
@@ -183,61 +309,25 @@ def multilabel_accuracy(y_hat, y):
     return label_wise_acc.item()
 
 def evaluate_model_metrics(net, data_iter, device):
-    """评估模型指标：收集预测结果并计算AUC和F1分数"""
+    """评估（基于准确率）并返回概率与标签，方便后续需要时扩展。"""
     net.eval()
     all_probs, all_labels = [], []
-    
-    # 收集预测结果
+    metric = Accumulator(2)
     with torch.no_grad():
         for batch in data_iter:
             input_ids, attention_mask, labels = move_batch_to_device(batch, device)
-            
             with torch.cuda.amp.autocast():
                 logits = net(input_ids, attention_mask)
-            
             probs = torch.sigmoid(logits)
             all_probs.append(probs.detach().cpu())
             all_labels.append(labels.detach().cpu())
-    
+            # 准确率（0.5 阈值）
+            acc = multilabel_accuracy(logits, labels.float())
+            metric.add(acc * labels.shape[0], labels.shape[0])
     probs = torch.cat(all_probs, dim=0).numpy()
     labels = torch.cat(all_labels, dim=0).numpy()
-    
-    # 计算AUC和F1分数
-    num_labels = probs.shape[1]
-    best_thresholds, per_label_f1, aucs = [], [], []
-    
-    for j in range(num_labels):
-        # AUC计算
-        try:
-            auc = roc_auc_score(labels[:, j], probs[:, j])
-        except Exception:
-            auc = float('nan')
-        aucs.append(auc)
-
-        # 使用精确率-召回率曲线寻找能最大化F1的阈值（比固定网格更精细）
-        y_true, p = labels[:, j], probs[:, j]
-        try:
-            precision, recall, pr_thresholds = precision_recall_curve(y_true, p)
-            f1s = (2 * precision * recall) / (precision + recall + 1e-8)
-            best_idx = int(np.nanargmax(f1s))
-            best_f1 = float(f1s[best_idx])
-            # pr_thresholds长度为len(precision)-1，与precision/recall对齐
-            if best_idx == 0:
-                best_t = float(0.5)  # 当best_idx为0时阈值未定义，回退到0.5
-            else:
-                best_t = float(pr_thresholds[best_idx - 1])
-        except Exception:
-            best_t, best_f1 = 0.5, 0.0
-
-        best_thresholds.append(best_t)
-        per_label_f1.append(best_f1)
-    
-    # 宏平均
-    aucs_np = np.array(aucs, dtype=float)
-    macro_auc = float(np.nanmean(aucs_np)) if np.isnan(aucs_np).any() else float(aucs_np.mean())
-    macro_f1 = float(np.mean(per_label_f1))
-    
-    return probs, labels, macro_auc, macro_f1, best_thresholds
+    val_acc = metric[0] / metric[1]
+    return probs, labels, val_acc
 
 def train_gpt2_epoch(net, train_iter, loss, updater, device, scheduler=None, progress_bar=None, accumulation_steps=1, log_interval=50):
     """
@@ -256,30 +346,31 @@ def train_gpt2_epoch(net, train_iter, loss, updater, device, scheduler=None, pro
         # 混合精度前向传播
         with torch.cuda.amp.autocast():
             y_hat = net(input_ids, attention_mask)
-            # 确保标签是浮点类型
-            labels = labels.float()
-            l = loss(y_hat, labels)
-            # 梯度累积缩放
-            l = l / accumulation_steps
+            # 确保标签是浮点类型；仅用于损失的标签做平滑，准确率使用硬标签
+            labels_hard = labels.float()
+            labels_for_loss = labels_hard
+            if LABEL_SMOOTHING and LABEL_SMOOTHING > 0.0:
+                eps = float(LABEL_SMOOTHING)
+                labels_for_loss = labels_hard * (1.0 - eps) + 0.5 * eps
+            l = loss(y_hat, labels_for_loss)
 
         # 反向传播
         scaler.scale(l.sum()).backward()
 
-        # 梯度累积
-        if (batch_idx + 1) % accumulation_steps == 0:
-            scaler.unscale_(updater)
-            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
-            scaler.step(updater)
-            scaler.update()
-            updater.zero_grad()
+        # 每个 batch 都进行一次优化步
+        scaler.unscale_(updater)
+        torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+        scaler.step(updater)
+        scaler.update()
+        updater.zero_grad()
 
-            # 学习率调度（OneCycleLR需要在每个batch后调用）
-            if scheduler is not None:
-                scheduler.step()
+        # 学习率调度：每个 batch 后调用
+        if scheduler is not None:
+            scheduler.step()
 
         with torch.no_grad():
-            acc = multilabel_accuracy(y_hat, labels)
-            metric.add(l.sum() * accumulation_steps, acc * labels.shape[0], labels.shape[0])
+            acc = multilabel_accuracy(y_hat, labels_hard)
+            metric.add(l.sum(), acc * labels.shape[0], labels.shape[0])
 
         cost = time.time() - start_time
         if progress_bar is not None and ((batch_idx + 1) % log_interval == 0):
@@ -310,14 +401,12 @@ def train_gpt2_model(net, train_iter, val_iter, loss, trainer, num_epochs, devic
     """
     print('training on', devices)
 
-    if isinstance(devices, list) and len(devices) > 1:
-        # 多GPU
-        net = nn.DataParallel(net, device_ids=devices)
+    # 强制单卡，移除 DataParallel
 
     device = devices[0] if isinstance(devices, list) else devices
     net = net.to(device)
 
-    best_f1 = -1.0
+    best_acc = -1.0
     best_state = None
     best_thresholds = None
     epochs_no_improve = 0
@@ -332,35 +421,33 @@ def train_gpt2_model(net, train_iter, val_iter, loss, trainer, num_epochs, devic
             net, train_iter_tqdm, loss, trainer, device, scheduler, train_iter_tqdm, GRADIENT_ACCUMULATION_STEPS, log_interval=50
         )
 
-        # 验证
-        val_probs, val_labels, macro_auc, macro_f1, best_thrs = evaluate_model_metrics(net, val_iter, device)
+        # 验证（基于准确率）
+        val_probs, val_labels, val_acc = evaluate_model_metrics(net, val_iter, device)
 
         tqdm.write(
             f'Epoch {epoch + 1}: '
             f'loss {train_loss:.3f}, '
             f'train acc {train_acc:.3f}, '
-            f'val macro AUC {macro_auc:.4f}, '
-            f'val macro F1 {macro_f1:.4f}, '
+            f'val acc {val_acc:.4f}, '
             f'lr {trainer.param_groups[0]["lr"]:.6f}'
         )
 
-        # Early stopping & best checkpoint based on macro F1
-        if macro_f1 > best_f1:
-            best_f1 = macro_f1
+        # Early stopping & best checkpoint based on val accuracy
+        if val_acc > best_acc:
+            best_acc = val_acc
             best_state = {k: v.cpu().clone() for k, v in net.state_dict().items()}
-            best_thresholds = best_thrs
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
-                tqdm.write(f"Early stopping at epoch {epoch + 1} (best macro F1 {best_f1:.4f})")
+                tqdm.write(f"Early stopping at epoch {epoch + 1} (best val acc {best_acc:.4f})")
                 break
 
     # print(f'Training completed in {timer.stop():.1f} sec')
     if best_state is not None:
         net.load_state_dict(best_state)
-    print(f'Final: best val macro F1 {best_f1:.4f}')
-    return best_thresholds
+    print(f'Final: best val acc {best_acc:.4f}')
+    return None
 
 
 # 主执行代码
@@ -368,16 +455,19 @@ print("🚀 启动GPT2多标签分类训练")
 
 # 配置参数 - 可根据需要调整
 MAX_LENGTH = 128  # 最大序列长度
-BATCH_SIZE = 64   # 批次大小 (优化: 32 → 64)
-NUM_EPOCHS = 10  # 训练轮数
-UNFREEZE_LAYERS = 8  # 解冻的顶层层数（进一步提升可训练容量）
-GRADIENT_ACCUMULATION_STEPS = 1  # 梯度累积步数
-WARMUP_FRACTION = 0.05   # 学习率warmup占比（5%）
-MIN_LR_FACTOR = 0.2      # 学习率下限=初始lr的20%（放慢后期衰减）
+BATCH_SIZE = 32   # 批次大小 (优化: 32 → 64)
+NUM_EPOCHS = 8  # 训练轮数
+UNFREEZE_LAYERS = 4  # 解冻的顶层层数（提升可训练容量）
+GRADIENT_ACCUMULATION_STEPS = 1  # 梯度累积步数（更稳的有效 batch）
+WARMUP_FRACTION = 0.10   # 学习率warmup占比（10%）
+MIN_LR_FACTOR = 0.10      # 学习率下限=初始lr的10%
 DECAY_POWER = 2.0        # 余弦退火的进度幂次（>1 放慢前期下降）
+LABEL_SMOOTHING = 0.05   # BCE 标签平滑系数（0~0.1 通常更稳）
 
 # 设备配置
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+devices_for_training = device  # 强制单卡训练
 batch_size = BATCH_SIZE if torch.cuda.is_available() else 16
 num_epochs = NUM_EPOCHS
 
@@ -386,6 +476,7 @@ print(f"  最大序列长度: {MAX_LENGTH}")
 print(f"  批次大小: {batch_size}")
 print(f"  训练轮数: {num_epochs}")
 print(f"  解冻层数: {UNFREEZE_LAYERS}")
+print(f"  GPU 数量: {num_gpus}")
 print(f"  Warmup占比: {WARMUP_FRACTION}")
 print(f"  LR下限比例: {MIN_LR_FACTOR}")
 print(f"  衰减曲线幂次: {DECAY_POWER}")
@@ -394,56 +485,59 @@ print(f"  梯度累积步数: {GRADIENT_ACCUMULATION_STEPS}")
 # 数据加载
 train_iter, val_iter, test_iter, test_ids = create_dataloaders(data_dir, batch_size, MAX_LENGTH)
 
-# 模型
 net = GPT2ClassificationModel()
 net.to(device)
 unfreeze_gpt2_top_k_layers(net, k=UNFREEZE_LAYERS)
 
-# 模型编译优化 (PyTorch 2.0+)
-if hasattr(torch, 'compile'):
-    try:
-        net = torch.compile(net, mode="reduce-overhead")
-        print("✅ 启用模型编译优化")
-    except Exception as e:
-        print(f"⚠️  模型编译失败: {e}")
-
-# 梯度检查点优化
+# 加速：TF32 + 高效注意力（支持 30/40 系显卡）
+USE_EFFICIENT_ATTENTION = True  # True: 开启 Flash/efficient SDPA；False: 使用 math SDPA
 try:
-    net.gpt2.gradient_checkpointing_enable()
-    print("✅ 启用梯度检查点")
-except Exception:
-    pass
+    if torch.cuda.is_available():
+        import torch.backends.cuda as cuda_backends
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision('high')
+        except Exception:
+            pass
+
+        if USE_EFFICIENT_ATTENTION:
+            cuda_backends.enable_flash_sdp(True)
+            cuda_backends.enable_mem_efficient_sdp(True)
+            cuda_backends.enable_math_sdp(False)
+            print("✅ 使用 Flash/Efficient SDPA 后端")
+        else:
+            cuda_backends.enable_flash_sdp(False)
+            cuda_backends.enable_mem_efficient_sdp(False)
+            cuda_backends.enable_math_sdp(True)
+            print("✅ 使用 Math SDPA 后端")
+except Exception as e:
+    print(f"⚠️ SDPA/TF32 设置失败: {e}")
+
 
 print(f"可训练参数: {sum(p.numel() for p in net.parameters() if p.requires_grad):,}")
 
 # 优化器
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR
 
 # 优化器配置
 base_params = [p for n, p in net.named_parameters() if p.requires_grad and "classifier" not in n]
 head_params = [p for n, p in net.named_parameters() if p.requires_grad and "classifier" in n]
 
-trainer = AdamW([
-    {"params": base_params, "lr": 1e-4},   # 提高基座学习率
-    {"params": head_params, "lr": 2e-3},   # 提高分类头学习率
-], weight_decay=0.01)
-
-# 学习率调度：Warmup + 余弦退火到下限（按优化器step次数计算）
-total_optimizer_steps = max(1, (len(train_iter) * num_epochs) // max(1, GRADIENT_ACCUMULATION_STEPS))
-warmup_steps = max(1, int(WARMUP_FRACTION * total_optimizer_steps))
-
-def lr_lambda(current_step: int) -> float:
-    # warmup阶段：线性从0→1
-    if current_step < warmup_steps:
-        return float(current_step) / float(max(1, warmup_steps))
-    # 余弦退火阶段：从1退火到MIN_LR_FACTOR
-    progress = (current_step - warmup_steps) / float(max(1, total_optimizer_steps - warmup_steps))
-    progress = min(1.0, max(0.0, progress)) ** DECAY_POWER  # 幂次塑形：>1 放慢前期下降
-    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return float(MIN_LR_FACTOR + (1.0 - MIN_LR_FACTOR) * cosine)
-
-scheduler = LambdaLR(trainer, lr_lambda)
+try:
+    trainer = AdamW([
+        {"params": base_params, "lr": 5e-5},   # 更稳的骨干学习率
+        {"params": head_params, "lr": 1e-3},   # 更稳的分类头学习率
+    ], weight_decay=0.01, fused=True)
+    print("✅ 使用 fused AdamW")
+except TypeError:
+    trainer = AdamW([
+        {"params": base_params, "lr": 5e-5},
+        {"params": head_params, "lr": 1e-3},
+    ], weight_decay=0.01)
+    print("ℹ️ 当前环境不支持 fused AdamW，已回退普通 AdamW")
+# 不使用学习率调度器
+scheduler = None
 
 # 损失函数 - 从数据集中提取标签
 print("📊 计算类别权重...")
@@ -452,17 +546,23 @@ train_labels_array = np.array(train_iter.dataset['labels'])
 pos = train_labels_array.sum(axis=0)
 neg = len(train_labels_array) - pos
 pos_weight = torch.tensor((neg / (pos + 1e-6)).tolist(), dtype=torch.float).to(device)
+# 限制 pos_weight 上限，防止过大导致训练不稳
+pos_weight = torch.clamp(pos_weight, max=10.0)
 loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction="none")
 print(f"✅ 类别权重计算完成: {pos_weight.cpu().numpy()}")
 
 # 训练
 net.gpt2.config.use_cache = False
-try:
-    net.gpt2.gradient_checkpointing_enable()
-except Exception:
-    pass
+# 关闭梯度检查点以提升速度（显存足够时建议关闭，可设为 True 再开启）
+USE_GRADIENT_CHECKPOINTING = False
+if USE_GRADIENT_CHECKPOINTING:
+    try:
+        net.gpt2.gradient_checkpointing_enable()
+        print("✅ 启用梯度检查点")
+    except Exception:
+        pass
 
-best_thresholds = train_gpt2_model(net, train_iter, val_iter, loss, trainer, num_epochs, device, scheduler)
+best_thresholds = train_gpt2_model(net, train_iter, val_iter, loss, trainer, num_epochs, devices_for_training, scheduler)
 print("🎉 训练完成!")
 
 
@@ -533,7 +633,7 @@ def generate_submission(model, test_loader, device, test_ids, output_path, thres
     print(f"💾 提交文件已保存: {output_path}")
     print(f"📊 预测统计:")
     for i, col in enumerate(label_columns):
-        avg_prob = sum(pred[i] for pred in predictions) / len(predictions)
+        avg_prob = float(preds_array[:, i].mean())
         print(f"  {col}: 平均概率 {avg_prob:.4f}")
 
     return submission_df
